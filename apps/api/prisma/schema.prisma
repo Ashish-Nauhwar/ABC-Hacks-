@@ -1,0 +1,273 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  directUrl  = env("DIRECT_URL")
+  // Only extensions the app actually uses. Supabase-only ones (supabase_vault,
+  // pg_stat_statements) stay out so `prisma db push` also works on local Postgres.
+  extensions = [pgcrypto, postgis, uuid_ossp(map: "uuid-ossp"), vector]
+}
+
+enum UserRole {
+  CITIZEN
+  UNIVERSITY_ADMIN
+  GOVERNMENT_ADMIN
+  SUPER_ADMIN
+  // Legacy values from an earlier pass, superseded by GOVERNMENT_ADMIN /
+  // the new Authority model. Kept in the enum (not used by any route) only
+  // because a handful of existing User rows still reference them — dropping
+  // the values here would fail `prisma db push` against that live data.
+  MUNICIPAL_ADMIN
+  DEPARTMENT_OPERATOR
+  FIELD_WORKER
+}
+
+// Thematic domains from the Societal Innovation Collaboration Portal PS
+// (education, healthcare, agriculture, water resources, environment, energy,
+// urban development, accessibility, public administration, rural livelihoods).
+enum ChallengeDomain {
+  EDUCATION
+  HEALTHCARE
+  AGRICULTURE
+  WATER_RESOURCES
+  ENVIRONMENT
+  ENERGY
+  URBAN_DEVELOPMENT
+  ACCESSIBILITY
+  PUBLIC_ADMINISTRATION
+  RURAL_LIVELIHOODS
+  OTHER
+}
+
+// Priority scoring maps these to plain numbers: LOW=1, MEDIUM=2, HIGH=3,
+// CRITICAL=4. That number is one input (alongside AI confidence, report age,
+// etc.) to the weighted-arithmetic priorityScore on Report — no AI involved
+// in the scoring itself, only in producing this severity label.
+enum Severity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum ReportStatus {
+  SUBMITTED
+  ACKNOWLEDGED
+  ASSIGNED
+  IN_PROGRESS
+  RESOLVED
+  REJECTED
+  DUPLICATE
+}
+
+enum PartnerType {
+  STARTUP
+  MSME
+  CORPORATE
+  CSR
+  RESEARCH_LAB
+}
+
+model City {
+  id    String @id @default(cuid())
+  name  String
+  state String
+
+  users        User[]
+  universities University[]
+  reports      Report[]
+  authorities  Authority[]
+
+  @@unique([name, state])
+}
+
+// A Higher Education Institution (HEI) that challenges get routed to. A
+// university can cover several domains (specializations) and a domain can be
+// covered by several universities across the state — routing picks the best
+// match by district first, then falls back state-wide.
+model University {
+  id              String            @id @default(cuid())
+  name            String
+  type            String? // e.g. CENTRAL, STATE, PRIVATE, DEEMED — free text for MVP
+  specializations ChallengeDomain[]
+  cityId          String
+  city            City              @relation(fields: [cityId], references: [id])
+
+  users       User[]
+  reports     Report[]
+  authorities Authority[]
+
+  @@index([cityId])
+}
+
+// A specific person/official a report gets assigned to for action — a PWD
+// junior engineer, a municipal sanitation officer, a university's nodal
+// faculty coordinator, etc. Distinct from IndustryPartner (external org
+// directory) and the free-text facultyMentor field. Scoped exactly like a
+// staff User: set universityId for institution-side authorities, cityId for
+// government/district-side ones. Managed from the dashboard's "Authorities"
+// tab and picked in the Action Center's "Assign Authority" control; the
+// assignment is what the mobile app reads via Report.assignedAuthority.
+model Authority {
+  id          String            @id @default(cuid())
+  name        String
+  designation String?
+  department  String?
+  phone       String?
+  email       String?
+  domains     ChallengeDomain[]
+  isActive    Boolean           @default(true)
+
+  cityId       String?
+  city         City?       @relation(fields: [cityId], references: [id])
+  universityId String?
+  university   University? @relation(fields: [universityId], references: [id])
+
+  reports Report[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([cityId])
+  @@index([universityId])
+}
+
+// Lightweight directory of industries, startups, MSMEs, CSR orgs, and
+// research labs a university admin can loop in on a challenge. No workflow
+// engine for this pass — just a picker + a relation on Report.
+model IndustryPartner {
+  id           String            @id @default(cuid())
+  name         String
+  type         PartnerType
+  domains      ChallengeDomain[]
+  contactEmail String?
+
+  reports Report[]
+}
+
+model User {
+  id           String      @id @default(cuid())
+  name         String
+  email        String?     @unique
+  phone        String?     @unique
+  passwordHash String?
+  role         UserRole    @default(CITIZEN)
+
+  // Scope for RBAC: null for SUPER_ADMIN (sees everything), set for everyone else.
+  cityId       String?
+  city         City?       @relation(fields: [cityId], references: [id])
+  universityId String?
+  university   University? @relation(fields: [universityId], references: [id])
+
+  reportsSubmitted Report[]            @relation("ReportedBy")
+  statusEvents     ReportStatusEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Report {
+  id String @id @default(cuid())
+
+  // Citizen-submitted
+  description String
+  photoUrls   String[]
+  address     String?
+  latitude    Float
+  longitude   Float
+  // Real geography column, used only for ST_DWithin radius queries
+  // (duplicate detection). Nullable + populated via raw SQL right after
+  // creation, because Prisma Client can't assign Unsupported-type fields
+  // itself — a required Unsupported field with no default would silently
+  // remove `create()` from this model entirely.
+  location Unsupported("geography(Point, 4326)")?
+
+  // AI classification (single hosted LLM call, strict JSON output). All
+  // nullable because a freshly SUBMITTED report is created before the
+  // classification job runs — these get filled in once it completes.
+  domain       ChallengeDomain?
+  severity     Severity?
+  aiSummary    String?
+  aiConfidence Float?
+
+  // Plain weighted-arithmetic score (severity + confidence + age etc.), not AI
+  priorityScore Float @default(0)
+
+  status ReportStatus @default(SUBMITTED)
+
+  // Duplicate detection via pgvector cosine similarity
+  embedding     Unsupported("vector(768)")?
+  isDuplicate   Boolean  @default(false)
+  duplicateOfId String?
+  duplicateOf   Report?  @relation("DuplicateOf", fields: [duplicateOfId], references: [id])
+  duplicates    Report[] @relation("DuplicateOf")
+
+  // Lightweight team-formation placeholder set by the university admin —
+  // no full team/roster CRUD in this pass.
+  facultyMentor String?
+  teamNote      String?
+
+  // Optional industry/startup/CSR partner looped in by the university admin.
+  industryPartnerId String?
+  industryPartner   IndustryPartner? @relation(fields: [industryPartnerId], references: [id])
+
+  // The specific official/staff member responsible for acting on this
+  // report — set from the dashboard's "Assign Authority" control. Surfaced
+  // to the citizen on the mobile app's tracking screen.
+  assignedAuthorityId String?
+  assignedAuthority   Authority? @relation(fields: [assignedAuthorityId], references: [id])
+  assignedAt          DateTime?
+
+  // Proof of solution delivery / resolution, kept separate from the
+  // citizen's original submission photos.
+  resolutionEvidenceUrls String[]
+
+  // Citizen's post-resolution confirm/reopen response
+  feedbackRating  Int?
+  feedbackComment String?
+
+  cityId       String
+  city         City        @relation(fields: [cityId], references: [id])
+  universityId String?
+  university   University? @relation(fields: [universityId], references: [id])
+
+  reportedById String
+  reportedBy   User    @relation("ReportedBy", fields: [reportedById], references: [id])
+
+  statusEvents ReportStatusEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([cityId, status])
+  @@index([universityId, status])
+}
+
+// Issue evidence photos stored in Postgres and served at /api/issues/photos/:id.
+// Mobile used to persist local file:// URIs, which only work on the uploader's device.
+model IssuePhoto {
+  id           String   @id @default(cuid())
+  mimeType     String
+  data         Bytes
+  uploadedById String
+  createdAt    DateTime @default(now())
+
+  @@index([uploadedById])
+}
+
+// Audit trail — every status change is logged, not overwritten. Also what
+// powers the "track status" timeline in the mobile app.
+model ReportStatusEvent {
+  id          String       @id @default(cuid())
+  reportId    String
+  report      Report       @relation(fields: [reportId], references: [id])
+  status      ReportStatus
+  note        String?
+  changedById String
+  changedBy   User         @relation(fields: [changedById], references: [id])
+  createdAt   DateTime     @default(now())
+}

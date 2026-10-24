@@ -1,0 +1,603 @@
+/**
+ * Smoke-tests every API route against a running server.
+ * Usage (from apps/api): pnpm test:routes
+ *
+ * Expects the API at BASE_URL (default http://localhost:4000) and a working DB.
+ */
+import "dotenv/config";
+import { PrismaClient } from "@prisma/client";
+
+const BASE_URL = process.env.BASE_URL ?? "http://localhost:4000";
+
+// Prefer DIRECT_URL for this script's own Prisma client. Supabase's pooled
+// DATABASE_URL (PgBouncer transaction mode) breaks Prisma prepared statements
+// ("prepared statement s0 already exists") when the API and this script both
+// open clients against the pooler.
+const prismaUrl = process.env.DIRECT_URL ?? process.env.DATABASE_URL;
+const prisma = new PrismaClient(
+  prismaUrl ? { datasources: { db: { url: prismaUrl } } } : undefined,
+);
+
+type Json = Record<string, unknown> | null;
+
+interface StepResult {
+  name: string;
+  ok: boolean;
+  status: number;
+  detail: string;
+}
+
+const results: StepResult[] = [];
+const suffix = Date.now().toString(36);
+
+function pass(name: string, status: number, detail: string) {
+  results.push({ name, ok: true, status, detail });
+  console.log(`  PASS  [${status}] ${name} — ${detail}`);
+}
+
+function fail(name: string, status: number, detail: string) {
+  results.push({ name, ok: false, status, detail });
+  console.log(`  FAIL  [${status}] ${name} — ${detail}`);
+}
+
+async function request(
+  method: string,
+  path: string,
+  opts: { token?: string; body?: unknown; expect?: number | number[] } = {},
+): Promise<{ status: number; json: Json; text: string }> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (opts.body !== undefined) headers["Content-Type"] = "application/json";
+  if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
+
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method,
+    headers,
+    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+  });
+
+  const text = await res.text();
+  let json: Json = null;
+  try {
+    json = text ? (JSON.parse(text) as Json) : null;
+  } catch {
+    json = null;
+  }
+
+  const expected = opts.expect;
+  if (expected !== undefined) {
+    const allowed = Array.isArray(expected) ? expected : [expected];
+    if (!allowed.includes(res.status)) {
+      throw new Error(
+        `expected ${allowed.join("|")}, got ${res.status}: ${text.slice(0, 300)}`,
+      );
+    }
+  }
+
+  return { status: res.status, json, text };
+}
+
+async function checkDatabase(): Promise<boolean> {
+  console.log("\n== Database ==");
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    const [{ cities }] = await prisma.$queryRaw<{ cities: bigint }[]>`
+      SELECT COUNT(*)::bigint AS cities FROM "City"
+    `;
+    pass("prisma.$queryRaw", 200, `connected (cities=${cities})`);
+    return true;
+  } catch (error) {
+    const raw = error instanceof Error ? error.message : String(error);
+    const message =
+      raw
+        .split("\n")
+        .map((line) => line.trim())
+        .find((line) => line && !line.startsWith("Invalid `")) ?? raw.slice(0, 240);
+    fail("prisma.$queryRaw", 0, message);
+    return false;
+  }
+}
+
+async function ensureCity(): Promise<string> {
+  const existing = await prisma.city.findFirst();
+  if (existing) return existing.id;
+
+  const city = await prisma.city.create({
+    data: { name: `Test City ${suffix}`, state: "MH" },
+  });
+  console.log(`  seeded city ${city.id}`);
+  return city.id;
+}
+
+async function run() {
+  console.log(`\nAPI smoke test → ${BASE_URL}`);
+
+  // --- Health (Express process + DB) ---
+  console.log("\n== Health ==");
+  try {
+    const health = await request("GET", "/health");
+    if (health.status === 200 && health.json && (health.json as { db?: string }).db === "connected") {
+      pass("GET /health", health.status, JSON.stringify(health.json));
+    } else {
+      fail("GET /health", health.status, health.text.slice(0, 300));
+    }
+  } catch (error) {
+    fail("GET /health", 0, error instanceof Error ? error.message : String(error));
+    console.log("\nAPI is not reachable. Start it with: pnpm dev");
+    process.exitCode = 1;
+    return;
+  }
+
+  const dbOk = await checkDatabase();
+  if (!dbOk) {
+    console.log(`
+Direct Prisma check failed. Common causes with Supabase:
+  1. Pooled DATABASE_URL missing ?pgbouncer=true  (prepared statement errors)
+  2. Wrong password / URI in apps/api/.env
+  3. DIRECT_URL not set (this script prefers it for its own Prisma client)
+
+Fix: Supabase → Project Settings → Database → Connect → copy pooler + direct
+URIs, ensure DATABASE_URL ends with ?pgbouncer=true, restart pnpm dev, re-run.
+`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const cityId = await ensureCity();
+
+  // --- Auth ---
+  console.log("\n== Auth ==");
+  const citizenEmail = `citizen_${suffix}@test.local`;
+  const adminEmail = `admin_${suffix}@test.local`;
+  const password = "TestPass123!";
+
+  let citizenToken = "";
+  let adminToken = "";
+  let citizenId = "";
+
+  try {
+    const reg = await request("POST", "/api/auth/register", {
+      body: { name: "Citizen", email: citizenEmail, password, role: "CITIZEN", cityId },
+      expect: 201,
+    });
+    citizenToken = String((reg.json as { token: string }).token);
+    citizenId = String((reg.json as { user: { id: string } }).user.id);
+    pass("POST /api/auth/register (citizen)", reg.status, `user=${citizenId}`);
+  } catch (error) {
+    fail("POST /api/auth/register (citizen)", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const login = await request("POST", "/api/auth/login", {
+      body: { email: citizenEmail, password },
+      expect: 200,
+    });
+    citizenToken = String((login.json as { token: string }).token);
+    pass("POST /api/auth/login", login.status, "token issued");
+  } catch (error) {
+    fail("POST /api/auth/login", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const bad = await request("POST", "/api/auth/login", {
+      body: { email: citizenEmail, password: "wrong" },
+      expect: 401,
+    });
+    pass("POST /api/auth/login (bad password)", bad.status, "rejected as expected");
+  } catch (error) {
+    fail("POST /api/auth/login (bad password)", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const admin = await request("POST", "/api/auth/register", {
+      body: {
+        name: "Admin",
+        email: adminEmail,
+        password,
+        role: "SUPER_ADMIN",
+      },
+      expect: 201,
+    });
+    adminToken = String((admin.json as { token: string }).token);
+    pass("POST /api/auth/register (super admin)", admin.status, "token issued");
+  } catch (error) {
+    fail("POST /api/auth/register (super admin)", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  // --- Issues ---
+  console.log("\n== Issues ==");
+  let reportId = "";
+
+  try {
+    const unauth = await request("POST", "/api/issues", {
+      body: { description: "x", cityId, latitude: 18.5, longitude: 73.8 },
+      expect: 401,
+    });
+    pass("POST /api/issues (no auth)", unauth.status, "401 as expected");
+  } catch (error) {
+    fail("POST /api/issues (no auth)", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const created = await request("POST", "/api/issues", {
+      token: citizenToken,
+      body: {
+        description: `Pothole on main road near test ${suffix}`,
+        cityId,
+        latitude: 18.5204,
+        longitude: 73.8567,
+        address: "FC Road, Pune",
+        photoUrls: ["https://example.com/pothole.jpg"],
+      },
+      expect: 201,
+    });
+    reportId = String((created.json as { report: { id: string } }).report.id);
+    pass("POST /api/issues", created.status, `report=${reportId}`);
+  } catch (error) {
+    fail("POST /api/issues", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const list = await request("GET", "/api/issues", { token: citizenToken, expect: 200 });
+    const count = Array.isArray((list.json as { reports?: unknown[] }).reports)
+      ? (list.json as { reports: unknown[] }).reports.length
+      : 0;
+    pass("GET /api/issues", list.status, `${count} report(s)`);
+  } catch (error) {
+    fail("GET /api/issues", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  if (reportId) {
+    try {
+      const one = await request("GET", `/api/issues/${reportId}`, {
+        token: citizenToken,
+        expect: 200,
+      });
+      pass("GET /api/issues/:id", one.status, "found");
+    } catch (error) {
+      fail("GET /api/issues/:id", 0, error instanceof Error ? error.message : String(error));
+    }
+
+    try {
+      const dups = await request("GET", `/api/issues/${reportId}/duplicates`, {
+        token: adminToken,
+        expect: 200,
+      });
+      const n = Array.isArray((dups.json as { candidates?: unknown[] }).candidates)
+        ? (dups.json as { candidates: unknown[] }).candidates.length
+        : 0;
+      pass("GET /api/issues/:id/duplicates", dups.status, `${n} candidate(s)`);
+    } catch (error) {
+      fail("GET /api/issues/:id/duplicates", 0, error instanceof Error ? error.message : String(error));
+    }
+
+    try {
+      const citizenBlocked = await request("GET", `/api/issues/${reportId}/duplicates`, {
+        token: citizenToken,
+        expect: 403,
+      });
+      pass("GET /api/issues/:id/duplicates (citizen)", citizenBlocked.status, "403 as expected");
+    } catch (error) {
+      fail(
+        "GET /api/issues/:id/duplicates (citizen)",
+        0,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+
+    try {
+      const patched = await request("PATCH", `/api/issues/${reportId}`, {
+        token: adminToken,
+        body: {
+          status: "ASSIGNED",
+          note: "Assigned for smoke test",
+        },
+        expect: 200,
+      });
+      const status = (patched.json as { report: { status: string } }).report.status;
+      pass("PATCH /api/issues/:id", patched.status, `status=${status}`);
+    } catch (error) {
+      fail("PATCH /api/issues/:id", 0, error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  // --- Cities, Authorities, Staff & Audit ---
+  console.log("\n== Cities, Authorities, Staff & Audit ==");
+  let authorityId = "";
+
+  try {
+    const cities = await request("GET", "/api/cities", { token: citizenToken, expect: 200 });
+    const n = Array.isArray((cities.json as { cities?: unknown[] }).cities)
+      ? (cities.json as { cities: unknown[] }).cities.length
+      : 0;
+    pass("GET /api/cities", cities.status, `${n} cit(y/ies)`);
+  } catch (error) {
+    fail("GET /api/cities", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const created = await request("POST", "/api/authorities", {
+      token: adminToken,
+      body: {
+        name: `Test Officer ${suffix}`,
+        designation: "Junior Engineer",
+        department: "Public Works",
+        phone: "9999999999",
+        email: `officer_${suffix}@test.local`,
+        domains: ["URBAN_DEVELOPMENT"],
+        cityId,
+      },
+      expect: 201,
+    });
+    authorityId = String((created.json as { authority: { id: string } }).authority.id);
+    pass("POST /api/authorities", created.status, `authority=${authorityId}`);
+  } catch (error) {
+    fail("POST /api/authorities", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const citizenBlocked = await request("POST", "/api/authorities", {
+      token: citizenToken,
+      body: { name: "Nope", cityId },
+      expect: 403,
+    });
+    pass("POST /api/authorities (citizen)", citizenBlocked.status, "403 as expected");
+  } catch (error) {
+    fail("POST /api/authorities (citizen)", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const list = await request("GET", "/api/authorities", { token: adminToken, expect: 200 });
+    const n = Array.isArray((list.json as { authorities?: unknown[] }).authorities)
+      ? (list.json as { authorities: unknown[] }).authorities.length
+      : 0;
+    pass("GET /api/authorities", list.status, `${n} authorit(y/ies)`);
+  } catch (error) {
+    fail("GET /api/authorities", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  if (authorityId) {
+    try {
+      const patched = await request("PATCH", `/api/authorities/${authorityId}`, {
+        token: adminToken,
+        body: { department: "Roads & Bridges" },
+        expect: 200,
+      });
+      const department = (patched.json as { authority: { department?: string } }).authority.department;
+      pass("PATCH /api/authorities/:id", patched.status, `department=${department}`);
+    } catch (error) {
+      fail("PATCH /api/authorities/:id", 0, error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  if (reportId && authorityId) {
+    try {
+      const assigned = await request("PATCH", `/api/issues/${reportId}`, {
+        token: adminToken,
+        body: { assignedAuthorityId: authorityId },
+        expect: 200,
+      });
+      const report = (assigned.json as {
+        report: { status: string; assignedAuthority?: { id: string; name: string } | null };
+      }).report;
+      const ok = report.assignedAuthority?.id === authorityId;
+      if (ok) {
+        pass(
+          "PATCH /api/issues/:id (assign authority)",
+          assigned.status,
+          `status=${report.status} assignedAuthority=${report.assignedAuthority?.name}`,
+        );
+      } else {
+        fail(
+          "PATCH /api/issues/:id (assign authority)",
+          assigned.status,
+          `assignedAuthority not reflected: ${JSON.stringify(report)}`,
+        );
+      }
+    } catch (error) {
+      fail(
+        "PATCH /api/issues/:id (assign authority)",
+        0,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+
+    try {
+      const fetched = await request("GET", `/api/issues/${reportId}`, {
+        token: citizenToken,
+        expect: 200,
+      });
+      const report = (fetched.json as {
+        report: { assignedAuthority?: { id: string } | null; statusEvents?: unknown[] };
+      }).report;
+      const events = Array.isArray(report.statusEvents) ? report.statusEvents.length : 0;
+      const ok = report.assignedAuthority?.id === authorityId && events > 0;
+      if (ok) {
+        pass("GET /api/issues/:id (assignment reflected)", fetched.status, `statusEvents=${events}`);
+      } else {
+        fail(
+          "GET /api/issues/:id (assignment reflected)",
+          fetched.status,
+          `assignedAuthority/statusEvents missing: ${JSON.stringify(report)}`,
+        );
+      }
+    } catch (error) {
+      fail(
+        "GET /api/issues/:id (assignment reflected)",
+        0,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  let staffEmail = "";
+  try {
+    staffEmail = `staff_${suffix}@test.local`;
+    const staff = await request("POST", "/api/auth/staff", {
+      token: adminToken,
+      body: {
+        name: "Test Government Admin",
+        email: staffEmail,
+        password,
+        role: "GOVERNMENT_ADMIN",
+        cityId,
+      },
+      expect: 201,
+    });
+    pass("POST /api/auth/staff", staff.status, `email=${staffEmail}`);
+  } catch (error) {
+    fail("POST /api/auth/staff", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const citizenBlocked = await request("POST", "/api/auth/staff", {
+      token: citizenToken,
+      body: { name: "Nope", email: `blocked_${suffix}@test.local`, password, role: "GOVERNMENT_ADMIN", cityId },
+      expect: 403,
+    });
+    pass("POST /api/auth/staff (citizen)", citizenBlocked.status, "403 as expected");
+  } catch (error) {
+    fail("POST /api/auth/staff (citizen)", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const users = await request("GET", "/api/auth/users", { token: adminToken, expect: 200 });
+    const list = (users.json as { users?: { email: string }[] }).users ?? [];
+    const found = staffEmail ? list.some((u) => u.email === staffEmail) : true;
+    if (found) {
+      pass("GET /api/auth/users", users.status, `${list.length} staff user(s)`);
+    } else {
+      fail("GET /api/auth/users", users.status, `new staff account not found among ${list.length}`);
+    }
+  } catch (error) {
+    fail("GET /api/auth/users", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const audit = await request("GET", "/api/audit", { token: adminToken, expect: 200 });
+    const n = Array.isArray((audit.json as { events?: unknown[] }).events)
+      ? (audit.json as { events: unknown[] }).events.length
+      : 0;
+    pass("GET /api/audit", audit.status, `${n} event(s)`);
+  } catch (error) {
+    fail("GET /api/audit", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const citizenBlocked = await request("GET", "/api/audit", { token: citizenToken, expect: 403 });
+    pass("GET /api/audit (citizen)", citizenBlocked.status, "403 as expected");
+  } catch (error) {
+    fail("GET /api/audit (citizen)", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  // --- Universities & Industry Partners ---
+  console.log("\n== Universities & Industry Partners ==");
+  try {
+    const universities = await request("GET", "/api/universities", { token: citizenToken, expect: 200 });
+    const n = Array.isArray((universities.json as { universities?: unknown[] }).universities)
+      ? (universities.json as { universities: unknown[] }).universities.length
+      : 0;
+    pass("GET /api/universities", universities.status, `${n} university(ies)`);
+  } catch (error) {
+    fail("GET /api/universities", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const partners = await request("GET", "/api/industry-partners", { token: citizenToken, expect: 200 });
+    const n = Array.isArray((partners.json as { partners?: unknown[] }).partners)
+      ? (partners.json as { partners: unknown[] }).partners.length
+      : 0;
+    pass("GET /api/industry-partners", partners.status, `${n} partner(s)`);
+  } catch (error) {
+    fail("GET /api/industry-partners", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  // --- AI ---
+  console.log("\n== AI ==");
+  // Create a fresh report so classification has something SUBMITTED to analyze
+  let aiReportId = "";
+  try {
+    const created = await request("POST", "/api/issues", {
+      token: citizenToken,
+      body: {
+        description: `Broken streetlight near park ${suffix}`,
+        cityId,
+        latitude: 18.53,
+        longitude: 73.85,
+      },
+      expect: 201,
+    });
+    aiReportId = String((created.json as { report: { id: string } }).report.id);
+  } catch {
+    // already recorded above if create is broken
+  }
+
+  if (aiReportId) {
+    try {
+      const analyzed = await request("POST", "/api/ai/analyze-report", {
+        token: citizenToken,
+        body: { reportId: aiReportId },
+        expect: 200,
+      });
+      const report = (analyzed.json as { report: { domain?: string; severity?: string } }).report;
+      pass(
+        "POST /api/ai/analyze-report",
+        analyzed.status,
+        `domain=${report.domain ?? "null"} severity=${report.severity ?? "null"}`,
+      );
+    } catch (error) {
+      fail("POST /api/ai/analyze-report", 0, error instanceof Error ? error.message : String(error));
+    }
+  } else {
+    fail("POST /api/ai/analyze-report", 0, "skipped — could not create report");
+  }
+
+  // --- Analytics ---
+  console.log("\n== Analytics ==");
+  try {
+    const overview = await request("GET", "/api/analytics/overview", {
+      token: adminToken,
+      expect: 200,
+    });
+    const total = (overview.json as { totalReports?: number }).totalReports;
+    pass("GET /api/analytics/overview", overview.status, `totalReports=${total}`);
+  } catch (error) {
+    fail("GET /api/analytics/overview", 0, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    const blocked = await request("GET", "/api/analytics/overview", {
+      token: citizenToken,
+      expect: 403,
+    });
+    pass("GET /api/analytics/overview (citizen)", blocked.status, "403 as expected");
+  } catch (error) {
+    fail(
+      "GET /api/analytics/overview (citizen)",
+      0,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+
+  // --- Summary ---
+  const failed = results.filter((r) => !r.ok);
+  const passed = results.filter((r) => r.ok);
+  console.log(`\n== Summary ==`);
+  console.log(`Passed: ${passed.length}`);
+  console.log(`Failed: ${failed.length}`);
+  if (failed.length) {
+    console.log("Failed steps:");
+    for (const f of failed) console.log(`  - ${f.name}: ${f.detail}`);
+    process.exitCode = 1;
+  } else {
+    console.log("All route checks passed.");
+  }
+}
+
+run()
+  .catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    await prisma.$disconnect();
+  });
