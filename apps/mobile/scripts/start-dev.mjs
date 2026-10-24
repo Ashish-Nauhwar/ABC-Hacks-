@@ -84,11 +84,12 @@ const child = spawn(
   "pnpm",
   ["exec", "expo", "start", "--lan", ...extraArgs],
   {
-    stdio: "inherit",
+    stdio: ["ignore", "inherit", "inherit"],
     env: process.env,
     shell: true,
   },
 );
+
 
 child.on("exit", (code, signal) => {
   if (signal) process.kill(process.pid, signal);
