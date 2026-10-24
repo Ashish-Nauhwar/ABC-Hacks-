@@ -170,15 +170,32 @@ pnpm install
 
 - **Backend API Base URL**: `http://localhost:4000`
 - **Frontend Admin Dashboard**: `http://localhost:3000`
-- **Mobile Expo Server**: Runs locally (Port varies, accessible via Expo Go QR code)
+- **Mobile Expo Server**: `exp://10.81.190.194:8081` (Port 8081, accessible via Expo Go)
+
+### 🔑 Demo Admin Credentials
+- **Email**: `dashboard.admin@test.local`
+- **Password**: `Admin@123`
+
+---
 
 ## 🛠 Useful Monorepo Commands
 You can run the following commands from the **root directory** utilizing Turborepo:
 - `pnpm dev` — Runs the development servers for all apps concurrently (API, Mobile, and Web).
+- `pnpm --filter @civic/api dev` — Runs only the Backend API server.
+- `pnpm --filter @civic/dashboard dev` — Runs only the Admin Web Dashboard.
+- `pnpm --filter @civic/mobile dev` — Runs only the Mobile Expo dev server.
 - `pnpm build` — Builds all packages in the monorepo for production.
 - `pnpm lint` — Runs TypeScript type-checking and linter across all workspaces.
 
 ---
 
+## 💡 Database Notes (Supabase)
+- When connecting via Supabase on Windows / IPv4 networks, use the **Session Mode Pooler** for `DIRECT_URL`:
+  `postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres`
+- Ensure special characters in passwords (such as `@`) are URL-encoded (e.g. `@` ➔ `%40`).
+
+---
+
 ## 📝 License
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
