@@ -9,6 +9,7 @@ The platform is structured as a **Monorepo** using [Turborepo](https://turbo.bui
 ### System Architecture
 
 ```mermaid
+
 graph TD
     %% Clients
     Mobile[📱 Mobile App<br>React Native / Expo]
