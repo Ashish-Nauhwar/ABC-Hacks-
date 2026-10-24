@@ -19,8 +19,22 @@ const PORT = process.env.PORT ?? 4000;
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
+app.get("/", (_req, res) => {
+  res.json({
+    name: "Nivaran Civic Platform API",
+    status: "active",
+    health: "/health",
+    version: "1.0.0",
+    endpoints: {
+      auth: "/api/auth",
+      issues: "/api/issues",
+      analytics: "/api/analytics",
+      cities: "/api/cities",
+    },
+  });
+});
+
 // Health check that also confirms Prisma can actually reach Postgres,
-// not just that the Express process is alive.
 app.get("/health", async (_req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
