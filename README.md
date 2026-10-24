@@ -189,7 +189,7 @@ You can run the following commands from the **root directory** utilizing Turbore
 
 ---
 
-## 💡 Database Notes (Supabase)
+## Database Notes (Supabase)
 - When connecting via Supabase on Windows / IPv4 networks, use the **Session Mode Pooler** for `DIRECT_URL`:
   `postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres`
 - Ensure special characters in passwords (such as `@`) are URL-encoded (e.g. `@` ➔ `%40`).
